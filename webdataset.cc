@@ -14,18 +14,9 @@
 #include <thread>
 #include <memory>
 
-#include "MPMCQueue.h"
-
 using namespace std;
 
 using Stdio = shared_ptr<FILE>;
-
-template <class T>
-using Channel = rigtorp::MPMCQueue<T>;
-
-using Sources = Channel<string>;
-
-const regex splitext_re(R"(([^/.]*|.*/[^/.]*)(\.[^/]*|))");
 
 class bad_tar_format : public exception {};
 class short_tar_read : public exception {};
@@ -68,12 +59,8 @@ struct Tarfile {
 };
 
 using TarfileP = shared_ptr<Tarfile>;
-using Tarfiles = Channel<TarfileP>;
-
-
 using Sample = map<string, string>;
 using SampleP = shared_ptr<Sample>;
-using Samples = Channel<SampleP>;
 
 template <class T>
 void dprint(const T &arg) {
@@ -126,26 +113,7 @@ Stdio gopen(const string &fname) {
     return Stdio(stream, fclose);
 }
 
-TarfileP TarfileEOF() {
-    auto result = make_shared<Tarfile>();
-    result->key = "__EOF__";
-    return result;
-}
-
-bool is_eof(Tarfile &tf) {
-    return tf.key == "__EOF__";
-}
-
-
-SampleP SampleEOF() {
-    auto result = make_shared<Sample>();
-    (*result)["__key__"] = "__EOF__";
-    return result;
-}
-
-bool is_eof(Sample &sample) {
-    return sample["__key__"] == "__EOF__";
-}
+const regex splitext_re(R"(([^/.]*|.*/[^/.]*)(\.[^/]*|))");
 
 auto splitext(string s) {
     auto groups = smatch{};
@@ -155,126 +123,99 @@ auto splitext(string s) {
     return make_tuple(base, ext);
 }
 
-bool read_file(TarfileP &result, Stdio stream) {
-    result = make_shared<Tarfile>();
-    if(feof(stream.get())) return false;
-    while(!feof(stream.get())) {
-        posix_header header;
-        int n1 = fread((char *)&header, 1, sizeof header, stream.get());
-        if(n1 != sizeof header) throw bad_tar_format();
-        if(header.typeflag == '\0') break;
-        result->key = string(header.prefix) + string(header.name);
-        // print("#", header.typeflag, quote(string(header.size, 12)), result->key);
-        int size = stoi(string(header.size, 12), nullptr, 8);
-        int blocks = (size + 511) / 512;
-        int rounded = blocks * 512;
-        if(rounded > 0) {
-            result->value.resize(rounded, '_');
-            int n2 = fread((char *)&result->value[0], 1, rounded, stream.get());
-            if(n2 != rounded) throw bad_tar_format();
-            result->value.resize(size);
-        }
-        if(header.typeflag != '0') continue;
-        return true;
+struct FileReader {
+    Stdio stream;
+    shared_ptr<Tarfile> item;
+    FileReader(Stdio stream) : stream(stream) {
     }
-    return false;
-}
-
-bool getsample(Sample &sample, Tarfiles &source) {
-    sample.clear();
-    string key = "";
-    for(;;) {
-        TarfileP file;
-        source.pop(file);
-        if(is_eof(*file)) {
-            return (sample.size() == 0);
-        }
-        auto [base, ext] = splitext(file->key);
-        assert(base != "");
-        if(key=="") {
-            key = base;
-            sample["__key__"s] = key;
-        }
-        if(key!=base) {
+    bool fetch() {
+        item = nullptr;
+        if(feof(stream.get())) return false;
+        while(!feof(stream.get())) {
+            posix_header header;
+            int n1 = fread((char *)&header, 1, sizeof header, stream.get());
+            if(n1 != sizeof header) throw bad_tar_format();
+            if(header.typeflag == '\0') break;
+            item = make_shared<Tarfile>();
+            item->key = string(header.prefix) + string(header.name);
+            int size = stoi(string(header.size, 12), nullptr, 8);
+            int blocks = (size + 511) / 512;
+            int rounded = blocks * 512;
+            if(rounded > 0) {
+                item->value.resize(rounded, '_');
+                int n2 = fread((char *)&item->value[0], 1, rounded, stream.get());
+                if(n2 != rounded) throw bad_tar_format();
+                item->value.resize(size);
+            }
+            if(header.typeflag != '0') continue;
             return true;
         }
-        sample[ext] = file->value;
+        return false;
     }
-}
-
-class ThreadedReader {
-public:
-    atomic<int> processed = 0;
-    bool running = true;
-    Sources sources{10000};
-    Tarfiles files{1000};
-    Samples samples{1000};
-    vector<thread> readers;
-    vector<thread> samplers;
-    void add_source(string source) {
-        sources.push(move(source));
+    shared_ptr<Tarfile> next() {
+        if(!item) fetch();
+        shared_ptr<Tarfile> result = item;
+        fetch();
+        return result;
     }
-    void start(int nreaders, int nsamplers) {
-        for(int i=0; i<nreaders; i++) {
-            readers.push_back(thread(&ThreadedReader::reader, this));
-        }
-        for(int i=0; i<nsamplers; i++) {
-            readers.push_back(thread(&ThreadedReader::sampler, this));
-        }
-    }
-    void reader() {
-        string source;
-        while(running) {
-            sources.pop(source);
-            Stdio stream = gopen(source);
-            for(;;) {
-                TarfileP file = make_shared<Tarfile>();
-                if(!read_file(file, stream)) break;
-                files.push(file);
-            }
-            processed += 1;
-        }
-    }
-    void sampler() {
-        while(running) {
-            SampleP sample = make_shared<Sample>();
-            getsample(*sample, files);
-            samples.push(sample);
-        }
-    }
-    SampleP next() {
-        for(;;) {
-            SampleP sample;
-            if(!samples.try_pop(sample)) {
-                nsleep(0.1);
-                continue;
-            }
-            return sample;
-        }
-    }
-    bool done() {
-    }
-    bool harvest() {
-        ::harvest(readers);
-        ::harvest(samplers);
-        return readers.size() > 0 || samplers.size() > 0;
-    }
-    void close() {
-        running = false;
-        while(harvest()) {
-            nsleep(0.3);
-        }
+    shared_ptr<Tarfile> peek() {
+        if(!item) fetch();
+        return item;
     }
 };
 
-int main() {
-    ThreadedReader reader;
-    reader.start(1, 1);
-    reader.add_source("imagenet-000000.tar");
-    for(;;) {
-        SampleP sample = reader.next();
-        if(is_eof(*sample)) break;
-        dprint((*sample)["__key__"s]);
+struct SampleReader {
+    shared_ptr<FileReader> source;
+    shared_ptr<Sample> item;
+    SampleReader(shared_ptr<FileReader> source) : source(source) {
     }
-    reader.close();
+    bool fetch() {
+        item = nullptr;
+        string key = "";
+        for(;;) {
+            auto file = source->peek();
+            if(!file) return bool(item);
+            auto [base, ext] = splitext(file->key);
+            assert(base != "");
+            if(key=="") {
+                key = base;
+                item = make_shared<Sample>();
+                (*item)["__key__"s] = key;
+            }
+            if(key!=base) {
+                return true;
+            }
+            (*item)[ext] = file->value;
+            source->next();
+        }
+    }
+    shared_ptr<Sample> next() {
+        if(!item) fetch();
+        shared_ptr<Sample> result = item;
+        fetch();
+        return result;
+    }
+    shared_ptr<Sample> peek() {
+        if(!item) fetch();
+        return item;
+    }
+};
+
+
+string url{"imagenet-000000.tar"};
+
+int main() {
+    auto stream = gopen(url);
+    shared_ptr<FileReader> files(new FileReader(stream));
+    shared_ptr<SampleReader> samples(new SampleReader(files));
+    for(int i=0;; i++) {
+        auto sample = samples->next();
+        if(!sample) break;
+        string keys;
+        for(auto [k, v] : *sample) {
+            keys += " ";
+            keys += k;
+        }
+        dprint(i, (*sample)["__key__"], keys);
+    }
 }
