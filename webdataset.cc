@@ -202,14 +202,46 @@ struct SampleReader {
 };
 
 
+struct WebDatasetReader {
+    vector<string> urls;
+    string current_url;
+    Stdio stream;
+    shared_ptr<FileReader> files;
+    shared_ptr<SampleReader> samples;
+    WebDatasetReader(const vector<string> &urls) : urls(urls) {
+    }
+    bool next_url() {
+        if(urls.size() == 0) return false;
+        current_url = urls[0];
+        urls.pop_back();
+        stream = gopen(current_url);
+        files.reset(new FileReader(stream));
+        samples.reset(new SampleReader(files));
+        return true;
+    }
+    bool forward() {
+        while(!samples || !samples->peek()) {
+            if(!next_url())
+                return  false;
+        }
+        return true;
+    }
+    shared_ptr<Sample> peek() {
+        forward();
+        return samples->peek();
+    }
+    shared_ptr<Sample> next() {
+        forward();
+        return samples->next();
+    }
+};
+
 string url{"imagenet-000000.tar"};
 
 int main() {
-    auto stream = gopen(url);
-    shared_ptr<FileReader> files(new FileReader(stream));
-    shared_ptr<SampleReader> samples(new SampleReader(files));
+    WebDatasetReader wds(vector<string>{url, url});
     for(int i=0;; i++) {
-        auto sample = samples->next();
+        auto sample = wds.next();
         if(!sample) break;
         string keys;
         for(auto [k, v] : *sample) {
