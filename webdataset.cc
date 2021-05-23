@@ -46,21 +46,10 @@ struct posix_header {           /* byte offset */
 struct Tarfile {
     string key;
     string value;
-    Tarfile() noexcept {}
-    Tarfile(const string &key, const string &value) : key(key), value(value) {}
-    Tarfile(const Tarfile &other) noexcept {
-        key = other.key;
-        value = other.value;
-    }
-    void operator=(const Tarfile &other) noexcept {
-        key = other.key;
-        value = other.value;
-    }
 };
 
-using TarfileP = shared_ptr<Tarfile>;
+//using Tarfile = tuple<string, string>;
 using Sample = map<string, string>;
-using SampleP = shared_ptr<Sample>;
 
 template <class T>
 void dprint(const T &arg) {
