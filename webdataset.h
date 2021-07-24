@@ -17,6 +17,7 @@ namespace webdataset {
 
     class IWebDatasetReader {
     public:
+        virtual void add_url(const std::string &) = 0;
         virtual void set_urls(const std::vector<std::string> &) = 0;
         virtual void set_refill(std::function<void(std::vector<std::string> &)>) = 0;
         virtual std::shared_ptr<Sample> peek() = 0;
